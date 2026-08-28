@@ -1,0 +1,5 @@
+anthropic
+pandas
+scikit-learn
+mlflow==2.16.2
+streamlit
