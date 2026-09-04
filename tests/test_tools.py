@@ -15,11 +15,24 @@ The tests fall into two groups:
 
 import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import pytest
 
 from src import config, tools
+
+@pytest.fixture(autouse=True)
+def no_git_pull(monkeypatch):
+    """Never sync during these tests.
+
+    Two reasons: a pull would reach the network, and the read-only assertions
+    below would then be measuring git's writes rather than the tools'. Sync
+    behaviour is covered on its own in tests/test_sync.py; the tests here that
+    care about the run_tool hook stub it explicitly.
+    """
+    monkeypatch.setenv("REE_ASSISTANT_SYNC", "0")
+
 
 needs_energy_forecast = pytest.mark.skipif(
     not config.energy_forecast_available(),
@@ -463,7 +476,11 @@ def test_scored_test_sets_are_disjoint_from_training_rows():
 
 @needs_energy_forecast
 def test_compare_models_does_not_touch_the_energy_forecast_project():
-    """Running the tools must not add, remove or modify any sibling file."""
+    """Running the tools must not add, remove or modify any sibling file.
+
+    Scoped to the tools themselves: the autouse fixture keeps sync off, since
+    src/sync.py's git pull is the one sanctioned write to that checkout.
+    """
     watched = sorted(
         p for p in config.ENERGY_FORECAST_DIR.rglob("*")
         if p.is_file() and ".git" not in p.parts and "__pycache__" not in p.parts
@@ -491,7 +508,7 @@ def test_every_schema_has_a_function_and_vice_versa():
     schema_names = [schema["name"] for schema in tools.TOOL_SCHEMAS]
 
     assert sorted(schema_names) == sorted(tools.TOOL_FUNCTIONS)
-    assert len(schema_names) == len(set(schema_names)) == 3
+    assert len(schema_names) == len(set(schema_names)) == 4
 
 
 def test_schemas_are_well_formed_anthropic_tool_definitions():
@@ -542,3 +559,222 @@ def test_run_tool_accepts_a_missing_input_dict(mlflow_db, monkeypatch):
     result = tools.run_tool("query_mlflow_runs")
 
     assert result["run_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Tool 4: get_live_status
+# ---------------------------------------------------------------------------
+
+# A copy of what refresh_metrics.yml commits, with every documented field.
+LIVE_METRICS = {
+    "computed_at": "2026-09-02T12:51:04.297087+00:00",
+    "live_data_fetched_at": "2026-09-02T11:10:09.378898+00:00",
+    "hours_since_live_fetch": 1.7,
+    "model_mae": 1204.9,
+    "baseline_mae": 832.1,
+    "improvement_pct": -44.8,
+    "win_rate_pct": 29.5,
+    "anomaly_count": 1,
+    "anomalies": [{"date": "2026-08-18", "model_error": 2292.7}],
+}
+
+
+@pytest.fixture
+def live_metrics_file(tmp_path):
+    """latest_metrics.json as the workflow writes it, computed just now."""
+
+    def write(**overrides):
+        payload = {**LIVE_METRICS, **overrides}
+        payload.setdefault(
+            "computed_at", datetime.now(timezone.utc).isoformat()
+        )
+        path = tmp_path / "latest_metrics.json"
+        path.write_text(json.dumps(payload))
+        return path
+
+    return write
+
+
+def test_get_live_status_returns_the_file_contents(live_metrics_file):
+    path = live_metrics_file(computed_at=datetime.now(timezone.utc).isoformat())
+
+    result = tools.get_live_status(path=path)
+
+    # Every field the workflow publishes comes back untouched.
+    for key, value in LIVE_METRICS.items():
+        if key == "computed_at":
+            continue
+        assert result[key] == value
+
+    assert result["anomalies"] == [{"date": "2026-08-18", "model_error": 2292.7}]
+    assert result["source_file"] == str(path)
+    assert result["file_modified_utc"].startswith("20")
+
+    json.dumps(result)
+
+
+def test_get_live_status_reports_fresh_metrics_as_fresh(live_metrics_file):
+    path = live_metrics_file(
+        computed_at=datetime.now(timezone.utc).isoformat(),
+        hours_since_live_fetch=0.4,
+    )
+
+    result = tools.get_live_status(path=path)
+
+    assert result["is_stale"] is False
+    assert result["hours_since_computed"] == pytest.approx(0.0, abs=0.1)
+    assert "staleness_note" not in result
+
+
+def test_get_live_status_flags_a_file_the_workflow_stopped_updating(live_metrics_file):
+    """hours_since_live_fetch was fine when written — the file itself went stale."""
+    stale = datetime.now(timezone.utc) - timedelta(hours=30)
+    path = live_metrics_file(computed_at=stale.isoformat(), hours_since_live_fetch=0.3)
+
+    result = tools.get_live_status(path=path)
+
+    assert result["is_stale"] is True
+    assert result["hours_since_computed"] == pytest.approx(30.0, abs=0.2)
+    assert "computed_at" in result["staleness_note"]
+
+
+def test_get_live_status_flags_stale_live_data(live_metrics_file):
+    path = live_metrics_file(
+        computed_at=datetime.now(timezone.utc).isoformat(),
+        hours_since_live_fetch=9.0,
+    )
+
+    result = tools.get_live_status(path=path)
+
+    assert result["is_stale"] is True
+
+
+def test_get_live_status_passes_through_fields_added_later(live_metrics_file):
+    """The workflow may grow new keys; this tool must not need editing for that."""
+    path = live_metrics_file(
+        computed_at=datetime.now(timezone.utc).isoformat(),
+        forecast_horizon_hours=48,
+    )
+
+    assert tools.get_live_status(path=path)["forecast_horizon_hours"] == 48
+
+
+def test_get_live_status_reports_a_missing_file(tmp_path):
+    with pytest.raises(tools.ToolError) as exc_info:
+        tools.get_live_status(path=tmp_path / "latest_metrics.json")
+
+    message = str(exc_info.value)
+    assert "latest_metrics.json not found" in message
+    # The message has to say what to do about it, since the model relays it.
+    assert "refresh_metrics.yml" in message
+    assert "pulled" in message
+
+
+def test_get_live_status_reports_a_corrupt_file(tmp_path):
+    path = tmp_path / "latest_metrics.json"
+    path.write_text("{ half a file")
+
+    with pytest.raises(tools.ToolError, match="not valid JSON"):
+        tools.get_live_status(path=path)
+
+
+def test_get_live_status_rejects_a_json_file_that_is_not_an_object(tmp_path):
+    path = tmp_path / "latest_metrics.json"
+    path.write_text("[1, 2, 3]")
+
+    with pytest.raises(tools.ToolError, match="should contain a JSON object"):
+        tools.get_live_status(path=path)
+
+
+def test_get_live_status_survives_an_unparseable_computed_at(live_metrics_file):
+    path = live_metrics_file(computed_at="not a timestamp")
+
+    result = tools.get_live_status(path=path)
+
+    assert result["hours_since_computed"] is None
+    # hours_since_live_fetch is still usable, so a verdict is still possible.
+    assert result["is_stale"] is False
+
+
+@needs_energy_forecast
+def test_get_live_status_against_the_real_file():
+    result = tools.get_live_status()
+
+    assert result["source_file"].endswith("latest_metrics.json")
+    for key in ("model_mae", "baseline_mae", "win_rate_pct", "anomaly_count"):
+        assert isinstance(result[key], (int, float))
+    assert isinstance(result["anomalies"], list)
+    assert len(result["anomalies"]) == result["anomaly_count"]
+    assert result["is_stale"] in (True, False)
+
+    json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# run_tool syncs before reading
+# ---------------------------------------------------------------------------
+
+
+def test_run_tool_syncs_before_dispatching(live_metrics_file, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        tools.sync,
+        "sync_energy_forecast",
+        lambda *a, **kw: calls.append("sync") or {"status": "ok", "changed": False},
+    )
+    path = live_metrics_file(computed_at=datetime.now(timezone.utc).isoformat())
+
+    result = tools.run_tool("get_live_status", {"path": str(path)})
+
+    assert calls == ["sync"]
+    assert result["model_mae"] == LIVE_METRICS["model_mae"]
+
+
+def test_run_tool_clears_caches_when_the_sync_pulled_new_commits(
+    live_metrics_file, monkeypatch
+):
+    """A pull can replace the files a cached result was computed from."""
+    cleared = []
+    monkeypatch.setattr(
+        tools.sync, "sync_energy_forecast", lambda *a, **kw: {"status": "ok", "changed": True}
+    )
+    monkeypatch.setattr(tools, "clear_caches", lambda: cleared.append("cleared"))
+    path = live_metrics_file(computed_at=datetime.now(timezone.utc).isoformat())
+
+    tools.run_tool("get_live_status", {"path": str(path)})
+
+    assert cleared == ["cleared"]
+
+
+def test_run_tool_leaves_caches_alone_when_nothing_changed(live_metrics_file, monkeypatch):
+    cleared = []
+    monkeypatch.setattr(
+        tools.sync, "sync_energy_forecast", lambda *a, **kw: {"status": "ok", "changed": False}
+    )
+    monkeypatch.setattr(tools, "clear_caches", lambda: cleared.append("cleared"))
+    path = live_metrics_file(computed_at=datetime.now(timezone.utc).isoformat())
+
+    tools.run_tool("get_live_status", {"path": str(path)})
+
+    assert cleared == []
+
+
+def test_run_tool_still_answers_when_the_sync_fails(live_metrics_file, monkeypatch):
+    """A failed pull must degrade to local data, not to a failed tool call."""
+    monkeypatch.setattr(
+        tools.sync,
+        "sync_energy_forecast",
+        lambda *a, **kw: {"status": "failed", "changed": False, "detail": "offline"},
+    )
+    path = live_metrics_file(computed_at=datetime.now(timezone.utc).isoformat())
+
+    result = tools.run_tool("get_live_status", {"path": str(path)})
+
+    assert "error" not in result
+    assert result["win_rate_pct"] == LIVE_METRICS["win_rate_pct"]
+
+
+def test_clear_caches_empties_the_scored_test_set_cache():
+    tools.clear_caches()
+
+    assert tools._scored_test_set.cache_info().currsize == 0

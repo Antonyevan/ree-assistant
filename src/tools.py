@@ -7,18 +7,30 @@ Anthropic client in this module and no network access; the agent loop that calls
 these lives in a later step, and the tools are fully usable (and tested) without
 it.
 
-Three tools:
+Four tools:
 
 * ``detect_anomalies``   — wraps ``anomaly_detection.detect_anomalies``
 * ``query_mlflow_runs``  — reads the MLflow run history from ``mlflow.db``
 * ``compare_models``     — historical vs recent model, using the logic in
                            ``train_model.py`` / ``train_model_recent.py`` /
                            ``dashboard.py``
+* ``get_live_status``    — reads ``latest_metrics.json``, the figures the live
+                           dashboard is showing right now
+
+The first three recompute from local data files and answer for their own test
+window. ``get_live_status`` reads what energy-forecast's refresh_metrics.yml
+workflow computed and committed (every 30 minutes), so it is both faster and
+authoritative for "what is it doing *now*" — and it carries its own freshness
+fields, which the recomputing tools cannot.
 
 Read-only, deliberately
 -----------------------
-Nothing here writes to the energy-forecast project. Three specific precautions,
-since the obvious implementations would all violate that:
+No tool here writes to the energy-forecast project. The single exception in
+this codebase is src/sync.py, which runs ``git pull`` in that checkout before a
+tool reads it — see run_tool below and that module's docstring.
+
+Three specific precautions, since the obvious implementations would all violate
+the read-only rule:
 
 1. We import ``features`` and ``anomaly_detection`` (pure function libraries)
    but never ``train_model.py``, ``train_model_recent.py`` or ``dashboard.py``.
@@ -47,7 +59,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from src import config
+from src import config, sync
 
 # Mirrors the feature list in train_model.py, train_model_recent.py and
 # dashboard.py. Kept as a constant here rather than imported, because the
@@ -69,6 +81,13 @@ DATASETS = ("recent", "historical")
 # Keeps a tool result small enough to hand back to a model without flooding it.
 MAX_ANOMALY_ROWS = 50
 MAX_RUNS = 100
+
+# Written by energy-forecast's refresh_metrics.yml workflow.
+LATEST_METRICS_FILENAME = "latest_metrics.json"
+
+# Live data lands every 30 minutes and metrics are computed every 30 minutes, so
+# anything older than this means a workflow has stopped or the checkout is behind.
+STALE_AFTER_HOURS = 2.0
 
 
 class ToolError(RuntimeError):
@@ -156,6 +175,24 @@ def _improvement_pct(baseline_mae: float, model_mae: float) -> float | None:
     if not baseline_mae:
         return None
     return round((baseline_mae - model_mae) / baseline_mae * 100, 1)
+
+
+def _hours_since(timestamp: str | None) -> float | None:
+    """Hours between an ISO-8601 timestamp and now, or None if unparseable.
+
+    Used on latest_metrics.json's own ``computed_at``: if the refresh workflow
+    stops running, the freshness numbers it recorded stay reassuring while the
+    file itself goes stale, and only this catches it.
+    """
+    if not timestamp:
+        return None
+    try:
+        when = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return round((datetime.now(timezone.utc) - when).total_seconds() / 3600, 1)
 
 
 def _iso(ms: int | None) -> str | None:
@@ -454,10 +491,90 @@ def compare_models() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Tool 4: live status
+# ---------------------------------------------------------------------------
+
+
+def get_live_status(path: str | Path | None = None) -> dict[str, Any]:
+    """Return what the live dashboard is showing right now.
+
+    Reads latest_metrics.json, which energy-forecast's refresh_metrics.yml
+    workflow recomputes and commits every 30 minutes. Unlike compare_models and
+    detect_anomalies, this does not recompute anything: it reports the figures
+    that project itself published, over the window it actually used.
+
+    The file's keys are passed through verbatim, so fields added to the workflow
+    later show up here without a change to this tool. We add only provenance and
+    a staleness verdict alongside them.
+    """
+    metrics_path = (
+        Path(path)
+        if path is not None
+        else config.ENERGY_FORECAST_DIR / LATEST_METRICS_FILENAME
+    )
+
+    if not metrics_path.exists():
+        raise ToolError(
+            f"{LATEST_METRICS_FILENAME} not found at {metrics_path} — the "
+            "refresh_metrics.yml workflow in energy-forecast may not have run yet, "
+            "or this checkout has not been pulled since it landed"
+        )
+
+    try:
+        contents = json.loads(metrics_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"{metrics_path} is not valid JSON: {exc}") from exc
+
+    if not isinstance(contents, dict):
+        raise ToolError(
+            f"{metrics_path} should contain a JSON object, got {type(contents).__name__}"
+        )
+
+    payload: dict[str, Any] = {
+        "source_file": str(metrics_path),
+        "file_modified_utc": _iso(int(metrics_path.stat().st_mtime * 1000)),
+        "stale_after_hours": STALE_AFTER_HOURS,
+    }
+    payload.update(contents)  # the file wins on any key we also set
+
+    hours_since_computed = _hours_since(contents.get("computed_at"))
+    payload["hours_since_computed"] = hours_since_computed
+
+    ages = [
+        age
+        for age in (hours_since_computed, contents.get("hours_since_live_fetch"))
+        if isinstance(age, (int, float))
+    ]
+    payload["is_stale"] = max(ages) > STALE_AFTER_HOURS if ages else None
+    if payload["is_stale"]:
+        payload["staleness_note"] = (
+            "These figures are older than expected. Either energy-forecast's "
+            "scheduled workflows have stopped running, or this checkout is behind "
+            "its remote. Report the numbers as of computed_at, not as current."
+        )
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Registry — what the agent loop in the next step will hand to the model
 # ---------------------------------------------------------------------------
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "name": "get_live_status",
+        "description": (
+            "Return the solar forecasting model's current published performance — "
+            "model_mae, baseline_mae, improvement_pct, win_rate_pct and today's "
+            "anomalies — as recomputed and committed by the project's own workflow "
+            "every 30 minutes, together with how fresh those figures are. This is "
+            "the fast, authoritative answer for anything about right now, today, or "
+            "what the live dashboard is showing. Prefer it over compare_models and "
+            "detect_anomalies for current status; those recompute from local test "
+            "data and may cover a different window."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
     {
         "name": "detect_anomalies",
         "description": (
@@ -528,10 +645,21 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 TOOL_FUNCTIONS = {
+    "get_live_status": get_live_status,
     "detect_anomalies": detect_anomalies,
     "query_mlflow_runs": query_mlflow_runs,
     "compare_models": compare_models,
 }
+
+
+def clear_caches() -> None:
+    """Drop computations derived from the sibling project's data files.
+
+    Called after a sync that moved HEAD: a pull can replace the very CSV, JSON
+    and pickle those results were computed from, and a cached answer from before
+    the pull is exactly the staleness this is meant to remove.
+    """
+    _scored_test_set.cache_clear()
 
 
 def run_tool(name: str, tool_input: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -544,6 +672,12 @@ def run_tool(name: str, tool_input: dict[str, Any] | None = None) -> dict[str, A
     func = TOOL_FUNCTIONS.get(name)
     if func is None:
         return {"error": f"unknown tool {name!r}; available: {', '.join(TOOL_FUNCTIONS)}"}
+
+    # Every tool here reads local files from the sibling checkout, so refresh it
+    # first. sync_energy_forecast never raises and rate-limits itself, so a
+    # failure or a burst of tool calls costs us nothing but a log line.
+    if sync.sync_energy_forecast().get("changed"):
+        clear_caches()
 
     try:
         return func(**(tool_input or {}))
