@@ -55,6 +55,56 @@ Each tool is a thin, read-only wrapper around code in the solar forecasting proj
 
 ---
 
+## The agent loop
+
+`src/agent.py` takes a question, hands it to Claude along with `TOOL_SCHEMAS`,
+runs whatever tool the model asks for through `run_tool()`, and feeds the real
+result back so the final answer is grounded in this project's data.
+
+```bash
+python -m src.agent "What is the model's MAE right now?"
+```
+
+`ask()` returns an `AgentAnswer`: the answer text plus the full record of how it
+was reached — every tool call's name, arguments, result, whether it errored,
+how long it took, and which turn it happened on, along with token usage. That
+record is the point. Step 4 scores tool choice and arguments, not just the
+prose, and it cannot do that from a string.
+
+Four things the loop gets right, each covered by a test:
+
+* **No tool needed** — a question that doesn't require data is answered in one
+  round trip, with an empty `tool_calls` list.
+* **Several tools in one turn** — a question spanning live status and the
+  backtest gets both, and all results go back in a *single* user message.
+  Splitting them teaches the model to stop asking for tools in parallel.
+* **Tool errors reach the model** — a `{"error": ...}` payload from `run_tool`
+  goes back as a `tool_result` with `is_error: true`, so Claude can explain
+  what failed instead of the loop crashing or inventing an answer.
+* **A turn ceiling** — a model that keeps asking for tools stops at `MAX_TURNS`
+  and says so, rather than running up the bill.
+
+The model is `config.MODEL` at every call site; `agent.py` contains no model
+string, and a test asserts that by grepping its own source. Switching models is
+a config change or `REE_ASSISTANT_MODEL=...`, never an edit here. For the same
+reason the request carries no `thinking` or `effort` parameters — those are
+model-gated, and the default model does not accept them.
+
+### Free tests and live tests
+
+The unit tests drive the loop with a fake Anthropic client: no network, no cost,
+and they cover the cases that are awkward to provoke on demand against a real
+model. Two `@live` tests make real API calls and are skipped twice over — by the
+`-m "not live"` default in `pytest.ini` and by an env var — so the default suite
+and CI stay free:
+
+```bash
+pytest tests/                                                  # free, the default
+REE_ASSISTANT_LIVE_TESTS=1 pytest tests/ -m live -v            # real calls, real cents
+```
+
+---
+
 ## Setup
 
 ```bash
@@ -80,6 +130,7 @@ Tests requiring the sibling project's data skip automatically when it isn't pres
 | `src/config.py` | Model id, sibling project path, availability check |
 | `src/tools.py` | The four tools, their schemas, and the dispatcher |
 | `src/sync.py` | Pulls the sibling checkout before a tool reads it; never fatal |
+| `src/agent.py` | Step 3: the tool-calling loop, the run record, and a small CLI |
 | `scripts/smoke_test_api.py` | One trivial live API call, confirming the key works |
 | `tests/test_setup.py` | Scaffold and config resolution |
 | `tests/test_tools.py` | Each tool verified in isolation — no LLM, no network |
