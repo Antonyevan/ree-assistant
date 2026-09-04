@@ -20,7 +20,7 @@ Built in a fixed order. Each step only counts as done once its tests pass.
 |---|---|---|
 | 1 | Repo scaffold, API key confirmed working | ✅ Done |
 | 2 | Tools layer — four read-only wrappers, each tested in isolation | ✅ Done |
-| 3 | Agent loop — model selects a tool, runs it, answers from the real result | ⏳ In progress |
+| 3 | Agent loop — model selects a tool, runs it, answers from the real result | ✅ Done |
 | 4 | Evaluation harness — known-correct answers, scored before anything is trusted | Not started |
 | 5 | Guardrail tests — catch fabricated results and schema violations, enforced by CI | Not started |
 | 6 | Interface (Streamlit/CLI) and final documentation | Not started |
@@ -130,11 +130,13 @@ Tests requiring the sibling project's data skip automatically when it isn't pres
 | `src/config.py` | Model id, sibling project path, availability check |
 | `src/tools.py` | The four tools, their schemas, and the dispatcher |
 | `src/sync.py` | Pulls the sibling checkout before a tool reads it; never fatal |
-| `src/agent.py` | Step 3: the tool-calling loop, the run record, and a small CLI |
+| `src/agent.py` | The tool-calling loop, the run record, and a small CLI |
 | `scripts/smoke_test_api.py` | One trivial live API call, confirming the key works |
 | `tests/test_setup.py` | Scaffold and config resolution |
 | `tests/test_tools.py` | Each tool verified in isolation — no LLM, no network |
 | `tests/test_sync.py` | Sync behavior, including graceful failure |
+| `tests/test_agent.py` | Loop mechanics against a fake client, plus two opt-in live tests |
+| `pytest.ini` | Registers the `live` marker and deselects it by default |
 | `.github/workflows/run_tests.yml` | Runs pytest on every push and PR |
 
 ---
