@@ -136,6 +136,8 @@ Tests requiring the sibling project's data skip automatically when it isn't pres
 | `tests/test_tools.py` | Each tool verified in isolation — no LLM, no network |
 | `tests/test_sync.py` | Sync behavior, including graceful failure |
 | `tests/test_agent.py` | Loop mechanics against a fake client, plus two opt-in live tests |
+| `tests/eval_cases.py` | The 21 evaluation questions and their verified ground truth |
+| `tests/test_agent_eval.py` | Scores tool choice, arguments and faithfulness on each question |
 | `pytest.ini` | Registers the `live` marker and deselects it by default |
 | `.github/workflows/run_tests.yml` | Runs pytest on every push and PR |
 
