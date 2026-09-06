@@ -27,5 +27,8 @@ jobs:
       - name: Run tests
         # energy-forecast is not checked out in CI, so tools tests that need its
         # data/db skip themselves (see src/config.energy_forecast_available).
-        # No ANTHROPIC_API_KEY in CI: tests never make a live API call.
+        # No ANTHROPIC_API_KEY in CI: tests never make a live API call. The live
+        # marker is deselected by pytest.ini, so the guardrails and the eval's
+        # scoring logic are checked here for free — the guardrails run against
+        # the recorded answers in eval_results.json rather than a fresh model.
         run: pytest tests/ -v

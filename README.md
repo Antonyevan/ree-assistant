@@ -22,7 +22,7 @@ Built in a fixed order. Each step only counts as done once its tests pass.
 | 2 | Tools layer — four read-only wrappers, each tested in isolation | ✅ Done |
 | 3 | Agent loop — model selects a tool, runs it, answers from the real result | ✅ Done |
 | 4 | Evaluation harness — known-correct answers, scored before anything is trusted | ✅ Done |
-| 5 | Guardrail tests — catch fabricated results and schema violations, enforced by CI | Not started |
+| 5 | Guardrail tests — catch fabricated results and schema violations, enforced by CI | ✅ Done |
 | 6 | Interface (Streamlit/CLI) and final documentation | Not started |
 
 The evaluation harness (step 4) is built **before** any agent output is trusted — the same discipline as writing a regression test before trusting a bug fix.
@@ -131,6 +131,7 @@ Tests requiring the sibling project's data skip automatically when it isn't pres
 | `src/tools.py` | The four tools, their schemas, and the dispatcher |
 | `src/sync.py` | Pulls the sibling checkout before a tool reads it; never fatal |
 | `src/agent.py` | The tool-calling loop, the run record, and a small CLI |
+| `src/guardrails.py` | Number grounding, failure acknowledgement, redundancy counting |
 | `scripts/smoke_test_api.py` | One trivial live API call, confirming the key works |
 | `tests/test_setup.py` | Scaffold and config resolution |
 | `tests/test_tools.py` | Each tool verified in isolation — no LLM, no network |
@@ -138,6 +139,7 @@ Tests requiring the sibling project's data skip automatically when it isn't pres
 | `tests/test_agent.py` | Loop mechanics against a fake client, plus two opt-in live tests |
 | `tests/eval_cases.py` | The 21 evaluation questions and their verified ground truth |
 | `tests/test_agent_eval.py` | Scores tool choice, arguments and faithfulness on each question |
+| `tests/test_guardrails.py` | Fabrication, failure-reporting and redundancy checks, run in CI |
 | `pytest.ini` | Registers the `live` marker and deselects it by default |
 | `.github/workflows/run_tests.yml` | Runs pytest on every push and PR |
 
@@ -149,6 +151,48 @@ Tests requiring the sibling project's data skip automatically when it isn't pres
 - **No speculative scope** — exactly four tools, no vector database, no public deployment. Runs locally. Additional scope is added only once the current scope is built, tested, and evaluated.
 - **The one write is documented, not hidden** — the sync step's `git pull` is a deliberate, stated exception to the project's read-only principle, not an inconsistency to gloss over.
 - **The evaluation harness is built before the agent's output is ever trusted** — mirroring the exact discipline that governs the solar project's own regression tests.
+
+---
+
+## Guardrails
+
+The evaluation scores faithfulness with checks written per question, so it
+catches contradictions it was told to expect. Step 5 adds three checks that need
+no such foresight, and two of them run for free in CI against the recorded
+evaluation run — 21 real answers with the tool payloads behind them. Rerun the
+eval, commit the results, and the guardrails re-measure against fresh behaviour.
+
+**No figure without a tool call.** `ungrounded_numbers()` inverts the eval's
+question: instead of "did the answer say what we expected", it asks "did the
+answer state anything the tools never returned". Prose integers and dates are
+ignored; a number is treated as a claim if it carries a decimal, a unit, or a
+magnitude over 100. On the recorded run it flags one case, and that one is
+legitimate arithmetic (see below). Where no tool ran at all, there is nothing to
+derive from, so the check has no possible false positive.
+
+**No papering over a failure.** An error payload carries no data, so a figure
+stated alongside one is invented — the same check catches it, and
+`acknowledges_failure()` verifies the answer names the problem. The subtler case
+is a tool that succeeds but omits the field asked about; a fabricated value
+there is caught the same way.
+
+**No more tools than the question needs.** The two redundant-call cases the eval
+found are pinned by name. A third fails the build; fixing one of the two also
+fails, prompting the baseline to be tightened rather than left slack.
+
+### What the detector deliberately does not do
+
+Admitting derived arithmetic was measured, not assumed. On a real payload of 66
+numbers, allowing differences between returned figures grew the grounded set to
+1,962 values and halved sensitivity; allowing ratios grew it to 5,837, at which
+point fabricated figures like 950 and 1500 both passed. So the detector stays
+strict and the one known derivation — `ambiguous-drift` computing "about 9.5%"
+from two figures it correctly reported — is named in the test instead. A figure
+the agent computed rather than read gets flagged for a human, which is the
+cheaper error.
+
+These are not proof of correctness. A wrong claim made without numbers, or a
+figure that coincidentally matches an unrelated field, still gets through.
 
 ---
 

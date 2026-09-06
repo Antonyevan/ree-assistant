@@ -41,47 +41,10 @@ def dig(payload: Any, path: str) -> Any:
     return current
 
 
-# Dates and clock times are checked by quotes(), not by the number matcher.
-# Stripping them first stops "2026-09-04" from offering a stray 4 or 9.
-_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?|\b\d{1,2}:\d{2}\b")
-_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
-
-
-def numbers_in(text: str) -> list[tuple[float, int]]:
-    """Every number the text states, as (value, decimal places written)."""
-    found = []
-    for match in _TIMESTAMP.sub(" ", text).split():
-        for token in _NUMBER.finditer(match):
-            raw = token.group().replace(",", "")
-            decimals = len(raw.partition(".")[2])
-            try:
-                found.append((float(raw), decimals))
-            except ValueError:  # pragma: no cover - regex guarantees a number
-                pass
-    return found
-
-
-def mentions_number(text: str, value: float) -> bool:
-    """True if the answer states this number at any sensible precision.
-
-    Compares numerically rather than by string, because string matching gets
-    this exactly backwards: it rejects an answer *more* precise than expected.
-    Asked for a baseline MAE of 123.6121, the agent answered "123.61
-    (specifically 123.6121)" and the old matcher scored it as omitted, because
-    its candidate "123.6" was followed by another digit.
-
-    A stated number counts if the target rounds to it at the precision the
-    answer chose: "1205" matches 1204.9, "123.61" matches 123.6121, "900" does
-    not match 1204.9. Magnitude is what is checked — an improvement of -44.8%
-    is commonly written "44.8% worse" — so direction is a separate concern
-    (see forbids_unqualified).
-    """
-    target = abs(float(value))
-    for stated, decimals in numbers_in(text):
-        tolerance = 0.5 * (10.0**-decimals)
-        if abs(stated - target) <= tolerance + 1e-9:
-            return True
-    return False
+# The number matcher lives in src/guardrails.py, which the guardrail tests also
+# use. Two implementations that must agree is how the precision bug that this
+# eval's first run exposed would come back.
+from src.guardrails import mentions_number, numbers_in  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------
