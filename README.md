@@ -21,7 +21,7 @@ Built in a fixed order. Each step only counts as done once its tests pass.
 | 1 | Repo scaffold, API key confirmed working | ✅ Done |
 | 2 | Tools layer — four read-only wrappers, each tested in isolation | ✅ Done |
 | 3 | Agent loop — model selects a tool, runs it, answers from the real result | ✅ Done |
-| 4 | Evaluation harness — known-correct answers, scored before anything is trusted | Not started |
+| 4 | Evaluation harness — known-correct answers, scored before anything is trusted | ✅ Done |
 | 5 | Guardrail tests — catch fabricated results and schema violations, enforced by CI | Not started |
 | 6 | Interface (Streamlit/CLI) and final documentation | Not started |
 
@@ -154,4 +154,75 @@ Tests requiring the sibling project's data skip automatically when it isn't pres
 
 ## What didn't work
 
-*This section will be completed honestly once the project is further along — any tool call failure patterns, the actual evaluation pass rate if it turns out mediocre, and anything that had to be reworked. Left genuinely blank for now rather than filled with a placeholder claim.*
+### The evaluation result
+
+21 questions, scored on three dimensions. One live run (Claude Haiku 4.5,
+2026-09-04), 72,355 input and 4,354 output tokens:
+
+| Dimension | Result |
+|---|---|
+| Tool choice | 19/21 (90.5%) |
+| Arguments | 4/4 (100%) — only 4 questions imply arguments |
+| Faithfulness | 21/21 (100%) |
+| **All three** | **19/21 (90.5%)** |
+
+The first scoring of that run said 17/21 (81.0%). Two of the four failures
+turned out to be bugs in the grader, not the agent. Full detail in
+`eval_results.json`, which keeps both summaries.
+
+### Two grader bugs, found by reading the failures
+
+**The number matcher rejected answers that were too precise.** It built string
+candidates (`123.612`, `123.6`, `124`) and required one to appear with no digit
+following. Asked for a logged baseline MAE of 123.6121, the agent answered
+"123.61 (specifically 123.6121)" — correct to more places than expected — and
+every candidate failed its lookahead, because each was followed by another
+digit. Scored as omitting the number it had actually quoted exactly. It now
+compares numerically: a stated figure counts if the target rounds to it at the
+precision the answer chose, so 1205 matches 1204.9 and 900 does not. ISO dates
+and clock times are stripped first, so a timestamp cannot donate a stray digit.
+
+**A blacklist could not tell reporting from claiming.** The unflattering case
+forbade the substring "beats REE". The agent opened with "**No, this model does
+not beat REE's official day-ahead forecast**" and later wrote "Win rate: 29.5%
+(the model beats REE on less than 1 in 3 days)". The second line is true,
+unflattering, and contains the forbidden phrase. The check now works sentence by
+sentence and ignores any sentence carrying a qualifier ("not", "only", "less
+than", "worse"…), so it still catches "The model beats REE comfortably" while
+passing an honest report. Note this was not simple negation-blindness — the
+sentence that tripped it was a qualified true statement, not a negated one.
+
+Both fixes have regression tests built from the exact answer text that exposed
+them. Rescoring the recorded run changed exactly two scores, and no passing case
+flipped to failing — the fixes are corrections, not a loosening of the bar. The
+tool payloads were verified byte-identical before rescoring (same
+`latest_metrics.json` `computed_at`), and no answer was regenerated.
+
+The lesson worth keeping: an eval that fails a correct answer is not a stricter
+eval, it is a broken one, and the failure mode is invisible unless you read the
+answers rather than the score. Both bugs would have quietly understated the
+agent and, worse, would have rewarded a *less* precise answer.
+
+### Two genuine agent behaviours, left as failures
+
+The remaining 2/21 are real, and both are the same minor tendency — calling one
+redundant tool alongside the correct one:
+
+* **`mlflow-when`** ("When was the model last trained?") called
+  `get_live_status` before `query_mlflow_runs`. It reached the right answer
+  from the right source; the extra call was wasted.
+* **`compare-windows`** ("What date ranges do the two models' test periods
+  cover?") called `query_mlflow_runs` alongside `compare_models`.
+
+Both answered correctly — faithfulness passed on each. The eval scores them as
+tool-choice failures anyway, because "called the right tool plus one it did not
+need" is a real inefficiency worth measuring, and hiding it behind a tolerance
+would defeat the purpose. It costs latency and tokens rather than correctness,
+and it is the kind of thing a tolerance in the grader would have made invisible.
+
+### Not yet verified
+
+The two `@live` tests in `tests/test_agent.py` have never been run — the
+environment they were written in had no API key. The agent loop is nonetheless
+exercised against the real API 21 times by the evaluation above, so the loop
+itself is proven; those two specific tests are not.

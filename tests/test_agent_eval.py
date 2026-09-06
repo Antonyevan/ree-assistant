@@ -57,6 +57,10 @@ class CaseResult:
     id: str
     question: str
     tools_called: list[str]
+    # The payloads the tools returned. Kept so a grader fix can be applied to a
+    # recorded run instead of paying for a fresh one — which is exactly what
+    # happened to the first run of this eval.
+    tool_results: dict[str, Any]
     tool_choice: Score
     arguments: Score
     faithfulness: Score
@@ -136,6 +140,9 @@ def score(case: EvalCase, answer: agent.AgentAnswer) -> CaseResult:
         id=case.id,
         question=case.question,
         tools_called=answer.tool_names,
+        tool_results={
+            call.name: call.result for call in reversed(answer.tool_calls) if not call.is_error
+        },
         tool_choice=score_tool_choice(case, answer.tool_names),
         arguments=score_arguments(case, answer),
         faithfulness=score_faithfulness(case, answer),
@@ -402,6 +409,16 @@ def test_summarise_reports_each_dimension_separately():
         ("43 of 181 days", 43, True),
         ("43 of 181 days", 181, True),
         ("29.5% of days", 29.5, True),
+        # Regressions from the first eval run: an answer more precise than the
+        # expected value was scored as omitting it.
+        ("the baseline MAE logged was 123.61 (specifically 123.6121)", 123.6121, True),
+        ("123.6121", 123.6121, True),
+        ("123.61", 123.6121, True),
+        ("124", 123.6121, True),
+        ("123.9", 123.6121, False),
+        # Dates must not donate digits to the matcher.
+        ("computed on 2026-09-04 at 09:44", 4, False),
+        ("about 30% of days", 29.5, True),
     ],
 )
 def test_mentions_number(text, value, expected):
@@ -418,13 +435,27 @@ def test_dig_walks_dicts_and_lists():
     assert dig(payload, "runs.0.metrics.model_mae") == 1100.04
 
 
-def test_forbids_catches_a_contradicted_claim():
-    from tests.eval_cases import forbids
+def test_forbids_unqualified_catches_an_unqualified_claim():
+    from tests.eval_cases import forbids_unqualified
 
-    check = forbids("beats REE")
+    check = forbids_unqualified("beats REE")
 
     assert check("The model beats REE comfortably.", {})[0] is False
     assert check("The model is worse than REE.", {})[0] is True
+
+
+def test_forbids_unqualified_allows_a_true_but_awkward_sentence():
+    """The exact sentence that failed the first run, verbatim."""
+    from tests.eval_cases import forbids_unqualified
+
+    check = forbids_unqualified("beats REE")
+    answer = (
+        "**No, this model does not beat REE's official day-ahead forecast.**\n"
+        "- **Win rate:** 29.5% (the model beats REE on less than 1 in 3 days)"
+    )
+
+    passed, reason = check(answer, {})
+    assert passed is True, reason
 
 
 def test_staleness_expectation_follows_the_tool_result():

@@ -41,25 +41,45 @@ def dig(payload: Any, path: str) -> Any:
     return current
 
 
-def _normalise(text: str) -> str:
-    """Strip thousands separators so 1,204.9 and 1204.9 compare equal."""
-    return re.sub(r"(?<=\d),(?=\d)", "", text)
+# Dates and clock times are checked by quotes(), not by the number matcher.
+# Stripping them first stops "2026-09-04" from offering a stray 4 or 9.
+_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?|\b\d{1,2}:\d{2}\b")
+_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def numbers_in(text: str) -> list[tuple[float, int]]:
+    """Every number the text states, as (value, decimal places written)."""
+    found = []
+    for match in _TIMESTAMP.sub(" ", text).split():
+        for token in _NUMBER.finditer(match):
+            raw = token.group().replace(",", "")
+            decimals = len(raw.partition(".")[2])
+            try:
+                found.append((float(raw), decimals))
+            except ValueError:  # pragma: no cover - regex guarantees a number
+                pass
+    return found
 
 
 def mentions_number(text: str, value: float) -> bool:
-    """True if the answer states this number, allowing sign and rounding.
+    """True if the answer states this number at any sensible precision.
 
-    Magnitude is what matters: an improvement of -44.8% is commonly written
-    "44.8% worse", so the check is on the absolute value. Whether the direction
-    is stated correctly is a separate check (see forbids()).
+    Compares numerically rather than by string, because string matching gets
+    this exactly backwards: it rejects an answer *more* precise than expected.
+    Asked for a baseline MAE of 123.6121, the agent answered "123.61
+    (specifically 123.6121)" and the old matcher scored it as omitted, because
+    its candidate "123.6" was followed by another digit.
+
+    A stated number counts if the target rounds to it at the precision the
+    answer chose: "1205" matches 1204.9, "123.61" matches 123.6121, "900" does
+    not match 1204.9. Magnitude is what is checked — an improvement of -44.8%
+    is commonly written "44.8% worse" — so direction is a separate concern
+    (see forbids_unqualified).
     """
-    text = _normalise(text)
-    magnitude = abs(value)
-    candidates = {f"{magnitude:g}", f"{magnitude:.1f}", f"{round(magnitude):d}"}
-
-    for candidate in candidates:
-        # Word boundaries stop "4" from matching inside "44.8" or "2026".
-        if re.search(rf"(?<![\d.]){re.escape(candidate)}(?![\d])", text):
+    target = abs(float(value))
+    for stated, decimals in numbers_in(text):
+        tolerance = 0.5 * (10.0**-decimals)
+        if abs(stated - target) <= tolerance + 1e-9:
             return True
     return False
 
@@ -109,15 +129,38 @@ def quotes(tool: str, *paths: str) -> Check:
     return check
 
 
-def forbids(*phrases: str) -> Check:
-    """The answer must not make these claims (case-insensitive)."""
+# Words that turn a superiority phrase into a true, unflattering statement.
+_QUALIFIERS = (
+    "not", "n't", "never", "rarely", "only", "less than", "fewer than",
+    "under", "below", "worse", "fails", "barely", "no,", "seldom",
+)
+
+
+def forbids_unqualified(*phrases: str) -> Check:
+    """The answer must not assert these claims *without qualification*.
+
+    A flat blacklist is wrong here, and scored a correct answer as a failure:
+    asked whether the model beats REE, the agent opened with "No, this model
+    does not beat REE's official day-ahead forecast" and later wrote "Win rate:
+    29.5% (the model beats REE on less than 1 in 3 days)". The second line is
+    true and unflattering, but contains the forbidden substring.
+
+    So the unit of judgement is the sentence, and a sentence carrying a
+    qualifier is reporting rather than claiming.
+    """
 
     def check(answer: str, _results: dict[str, Any]) -> tuple[bool, str]:
-        lowered = answer.lower()
-        found = [phrase for phrase in phrases if phrase.lower() in lowered]
-        if found:
-            return False, f"answer claims {found!r}, which the data contradicts"
-        return True, "makes no contradicted claim"
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", answer):
+            lowered = sentence.lower()
+            claimed = next((p for p in phrases if p.lower() in lowered), None)
+            if claimed is None:
+                continue
+            if any(qualifier in lowered for qualifier in _QUALIFIERS):
+                continue
+            return False, (
+                f"asserts {claimed!r} without qualification: {sentence.strip()[:120]!r}"
+            )
+        return True, "makes no unqualified claim the data contradicts"
 
     return check
 
@@ -396,7 +439,7 @@ EVAL_CASES: list[EvalCase] = [
         tolerated_extras=frozenset({"compare_models", "get_live_status"}),
         faithfulness=all_of(
             requires_any("worse", "does not beat", "doesn't beat", "underperform", "higher error", "no,"),
-            forbids("outperforms REE", "beats REE", "better than REE's"),
+            forbids_unqualified("outperforms REE", "beats REE", "better than REE's"),
         ),
         notes="No. Live improvement_pct -44.8%, historical -35.0%. The honest answer is negative.",
     ),
@@ -407,7 +450,7 @@ EVAL_CASES: list[EvalCase] = [
         tolerated_extras=frozenset({"compare_models", "get_live_status"}),
         faithfulness=all_of(
             requires_any("negative", "worse", "-44.8", "-35.0", "underperform"),
-            forbids("positive improvement", "improvement is positive"),
+            forbids_unqualified("positive improvement", "improvement is positive"),
         ),
         notes="improvement_pct is -44.8 live and -35.0 historical. Negative on every window.",
     ),
