@@ -23,7 +23,7 @@ Built in a fixed order. Each step only counts as done once its tests pass.
 | 3 | Agent loop — model selects a tool, runs it, answers from the real result | ✅ Done |
 | 4 | Evaluation harness — known-correct answers, scored before anything is trusted | ✅ Done |
 | 5 | Guardrail tests — catch fabricated results and schema violations, enforced by CI | ✅ Done |
-| 6 | Interface (Streamlit/CLI) and final documentation | Not started |
+| 6 | Interface (Streamlit/CLI) and final documentation | ✅ Done |
 
 The evaluation harness (step 4) is built **before** any agent output is trusted — the same discipline as writing a regression test before trusting a bug fix.
 
@@ -132,6 +132,7 @@ Tests requiring the sibling project's data skip automatically when it isn't pres
 | `src/sync.py` | Pulls the sibling checkout before a tool reads it; never fatal |
 | `src/agent.py` | The tool-calling loop, the run record, and a small CLI |
 | `src/guardrails.py` | Number grounding, failure acknowledgement, redundancy counting |
+| `app.py` | Streamlit interface: answer, guardrail verdict, and the tool calls behind it |
 | `scripts/smoke_test_api.py` | One trivial live API call, confirming the key works |
 | `tests/test_setup.py` | Scaffold and config resolution |
 | `tests/test_tools.py` | Each tool verified in isolation — no LLM, no network |
@@ -140,6 +141,7 @@ Tests requiring the sibling project's data skip automatically when it isn't pres
 | `tests/eval_cases.py` | The 21 evaluation questions and their verified ground truth |
 | `tests/test_agent_eval.py` | Scores tool choice, arguments and faithfulness on each question |
 | `tests/test_guardrails.py` | Fabrication, failure-reporting and redundancy checks, run in CI |
+| `tests/test_app.py` | Interface behaviour via Streamlit's AppTest — no API call |
 | `pytest.ini` | Registers the `live` marker and deselects it by default |
 | `.github/workflows/run_tests.yml` | Runs pytest on every push and PR |
 
@@ -151,6 +153,34 @@ Tests requiring the sibling project's data skip automatically when it isn't pres
 - **No speculative scope** — exactly four tools, no vector database, no public deployment. Runs locally. Additional scope is added only once the current scope is built, tested, and evaluated.
 - **The one write is documented, not hidden** — the sync step's `git pull` is a deliberate, stated exception to the project's read-only principle, not an inconsistency to gloss over.
 - **The evaluation harness is built before the agent's output is ever trusted** — mirroring the exact discipline that governs the solar project's own regression tests.
+
+---
+
+## The interface
+
+```bash
+streamlit run app.py     # or: python -m src.agent "your question"
+```
+
+Deliberately not a plain chat window. Three things are on screen for every
+answer, because the project's claim is about *how* the answer was reached:
+
+* **The guardrail verdict, above the answer.** Every response is screened
+  through `src/guardrails.py` before it is displayed. A figure no tool returned
+  is shown to the reader in red, next to the answer that contains it — flagged,
+  never suppressed. A clean screen says so, and says explicitly that it is not a
+  guarantee of correctness.
+* **The tool calls, with their arguments and their raw payloads**, expandable
+  per call, with timing and turn number. If no tool was called, the interface
+  says that too, and notes that for a data question this is itself the problem
+  the guardrail checks for.
+* **The cost and shape of the run** — model, turns, input and output tokens,
+  stop reason.
+
+Opening the page calls nothing. The model is invoked only on submit, the example
+questions are text rather than buttons for the same reason, and the sidebar's
+figures are read from local files. A test asserts this by replacing `agent.ask`
+with a function that fails the test if called during load.
 
 ---
 
@@ -264,9 +294,57 @@ need" is a real inefficiency worth measuring, and hiding it behind a tolerance
 would defeat the purpose. It costs latency and tokens rather than correctness,
 and it is the kind of thing a tolerance in the grader would have made invisible.
 
+### What the 100% faithfulness score does not mean
+
+Faithfulness scored 21/21, and that number is the most misleading one on this
+page. It is measured by deterministic checks — does the answer state the figures
+the tool returned, does it avoid a specific contradicted claim — written per
+question, in advance, by someone who already knew what the tool would return.
+
+So it catches the failures that were anticipated. An answer that is fluent,
+quotes every figure correctly, and draws a wrong conclusion from them scores a
+pass. So does an answer that misdescribes what a metric measures, or attributes
+a number to the wrong window, as long as the digits match. There is no LLM judge
+here and no human read of all 21 answers against the underlying data.
+
+The guardrails in step 5 exist because of this gap, and they narrow it from a
+different direction — asking what the answer said that no tool returned, which
+needs no foresight — but they are numeric too. Neither mechanism catches a
+confident sentence containing no figures at all.
+
+Read 21/21 as "no anticipated contradiction was found in 21 answers", not as
+"the agent does not fabricate".
+
+### The interface's limits
+
+The screening shown beside each answer is the same deterministic check described
+under Guardrails, with the same blind spot: it catches figures that no tool
+returned, not claims that are wrong without being numeric. An answer that
+misdescribes what a number *means* while quoting it correctly passes the screen
+and is displayed with a green tick. The tick says "no issues found", not "this
+is correct", and is worded that way on purpose.
+
+The `review`-level flag fires on arithmetic the agent derived from figures it
+did report — a known false-positive category, kept because the alternative was
+measured to be worse (see above). Anyone reading the interface will see it
+occasionally on correct answers.
+
 ### Not yet verified
 
-The two `@live` tests in `tests/test_agent.py` have never been run — the
-environment they were written in had no API key. The agent loop is nonetheless
-exercised against the real API 21 times by the evaluation above, so the loop
-itself is proven; those two specific tests are not.
+The two `@live` tests in `tests/test_agent.py` have still never been run. Two
+attempts were made from an environment with no reachable credential — no
+`ANTHROPIC_API_KEY`, no `ant` CLI profile, no `.env` — and both ended in
+`TypeError: Could not resolve authentication method` at request time, which is
+an environment failure and says nothing about the agent. Account credit being
+available does not put a key in the shell the tests run from.
+
+To close this, run them from a shell that has the key:
+
+```bash
+REE_ASSISTANT_LIVE_TESTS=1 pytest tests/test_agent.py -m live -v
+```
+
+The loop itself is not unverified: the evaluation exercised `agent.ask()`
+against the real API 21 times, and those results are recorded. It is these two
+specific tests, and the three `@live` guardrail tests added in step 5, that have
+never executed.

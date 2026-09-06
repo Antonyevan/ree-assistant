@@ -203,3 +203,85 @@ def redundant_tool_count(tools_called, acceptable_tool_sets) -> int:
     it costs latency and tokens, and it is the tendency the eval caught twice.
     """
     return max(0, len(set(tools_called)) - minimum_tools_required(acceptable_tool_sets))
+
+
+# ---------------------------------------------------------------------------
+# Runtime screening, for the interface
+# ---------------------------------------------------------------------------
+
+
+class Finding:
+    """One thing worth telling the reader about an answer before they trust it."""
+
+    def __init__(self, level: str, title: str, detail: str):
+        self.level = level  # "warning" (likely wrong) | "review" (needs a human)
+        self.title = title
+        self.detail = detail
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"Finding({self.level!r}, {self.title!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Finding) and (self.level, self.title, self.detail) == (
+            other.level,
+            other.title,
+            other.detail,
+        )
+
+
+def screen(answer: str, tool_calls) -> list[Finding]:
+    """Run an answer through the guardrails before it is shown to anyone.
+
+    Takes the answer text and the agent's ToolCall records — anything with
+    .name, .result and .is_error — so this stays usable from the Streamlit app
+    without importing the agent.
+
+    Returns what a reader should know. An empty list means nothing was caught,
+    which is not the same as the answer being right.
+    """
+    findings: list[Finding] = []
+
+    succeeded = {call.name: call.result for call in tool_calls if not call.is_error}
+    failed = [call for call in tool_calls if call.is_error]
+
+    invented = ungrounded_numbers(answer, succeeded)
+    if invented:
+        if not succeeded:
+            findings.append(
+                Finding(
+                    "warning",
+                    "Figures stated with no successful tool call",
+                    f"{_join(invented)} appear in the answer, but no tool returned data. "
+                    "Nothing here is sourced.",
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    "review",
+                    "Figures not found in any tool result",
+                    f"{_join(invented)} do not appear in what the tools returned. "
+                    "This can be legitimate arithmetic the agent computed from figures it "
+                    "did report — the check stays strict rather than admitting derivations, "
+                    "because admitting them was measured to let fabricated values through.",
+                )
+            )
+
+    if failed and not acknowledges_failure(answer):
+        findings.append(
+            Finding(
+                "warning",
+                "A tool failed and the answer does not say so",
+                f"{_join_names(failed)} returned an error, but the answer reports no problem.",
+            )
+        )
+
+    return findings
+
+
+def _join(values) -> str:
+    return ", ".join(f"{value:g}" for value in values)
+
+
+def _join_names(calls) -> str:
+    return ", ".join(sorted({call.name for call in calls}))
