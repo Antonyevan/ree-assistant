@@ -329,22 +329,31 @@ did report — a known false-positive category, kept because the alternative was
 measured to be worse (see above). Anyone reading the interface will see it
 occasionally on correct answers.
 
-### Not yet verified
+### The live tests, now run
 
-The two `@live` tests in `tests/test_agent.py` have still never been run. Two
-attempts were made from an environment with no reachable credential — no
-`ANTHROPIC_API_KEY`, no `ant` CLI profile, no `.env` — and both ended in
-`TypeError: Could not resolve authentication method` at request time, which is
-an environment failure and says nothing about the agent. Account credit being
-available does not put a key in the shell the tests run from.
+All seven `@live` tests pass (2026-09-06): the two in `tests/test_agent.py`
+covering the loop end to end, and the five in `tests/test_guardrails.py` — three
+single-need questions each calling exactly one tool, an injected tool error
+being reported rather than papered over, and a missing field not being filled
+in.
 
-To close this, run them from a shell that has the key:
+They were written well before they could be executed. Earlier attempts ran from
+a shell with no reachable credential and ended in `TypeError: Could not resolve
+authentication method` at request time, which is an environment failure and says
+nothing about the agent, so the gap was recorded here rather than glossed over
+until it could actually be closed.
 
 ```bash
-REE_ASSISTANT_LIVE_TESTS=1 pytest tests/test_agent.py -m live -v
+REE_ASSISTANT_LIVE_TESTS=1 pytest -m live -v          # all seven
 ```
 
-The loop itself is not unverified: the evaluation exercised `agent.ask()`
-against the real API 21 times, and those results are recorded. It is these two
-specific tests, and the three `@live` guardrail tests added in step 5, that have
-never executed.
+Two things this does not mean. These are single runs against a nondeterministic
+model, so a pass is evidence rather than a guarantee — the redundant-tool
+tendency documented above is exactly the kind of behaviour that shows up on some
+runs and not others, and the single-need tests are the ones that would catch it
+regressing. And they are not in CI: they cost money on every run, so CI still
+covers only the free suite, and these have to be run deliberately.
+
+The loop itself was never the unverified part — the evaluation exercised
+`agent.ask()` against the real API 21 times, and those results are recorded in
+`eval_results.json`.
